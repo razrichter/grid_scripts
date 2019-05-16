@@ -1,0 +1,17 @@
+#!/bin/sh
+quiet=''
+if [ -z "$1" ]; then
+    echo "No job requested.... Quitting" >&2
+    exit 1
+elif [ "$1" = "-q" ]; then
+    quiet=1
+    shift 1
+fi
+jid=$1;
+no_job=`qstat -j $jid 2>&1 | grep 'jobs do not exist'`
+while [ -z "$no_job" ]; do
+    [ -z "$quiet" ] && echo -n '.'
+    sleep 60
+    no_job=`qstat -j $jid 2>&1 | grep 'jobs do not exist'`
+done
+[ -z "$quiet" ] && echo

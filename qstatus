@@ -1,0 +1,361 @@
+#!/usr/bin/env python
+# encoding: utf-8
+# -*- mode: python; coding: utf-8 -*-
+# vim: set fileencoding=utf-8:encoding=utf-8:syntax=python
+from __future__ import division, absolute_import, print_function, unicode_literals  # as python3 as possible
+
+
+import sys
+import getpass
+import argparse
+import logging
+import subprocess
+from collections import defaultdict, Counter
+import itertools
+import re
+
+from io import BytesIO
+
+try:
+    from lxml import etree
+except ImportError:
+    try:
+        import xml.etree.cElementTree as etree
+    except ImportError:
+        sys.stderr.write('Warning: importing slowest XML parser\n')
+        import xml.etree.ElementTree as etree
+
+# Constants
+_default_queue = 'default.q'  # JCVI specific
+
+# globals
+logging.basicConfig()
+log = logging.getLogger(__name__)
+
+
+class Host(object):
+
+    def __init__(self, queue_list):
+        self.queue_name, self.host_name = queue_list.find('name').text.split('@')
+        self.queue_type = queue_list.find('qtype').text
+        self.slots_used = int(queue_list.find('slots_used').text)
+        self.slots_reserved = int(queue_list.find('slots_resv').text)
+        self.slots_total = int(queue_list.find('slots_total').text)
+        load_avg = queue_list.find('np_load_avg')
+        if load_avg is not None:
+            self.load_avg = float(load_avg.text)
+        else:
+            self.load_avg = 0.0  # normally only in error states
+        state = queue_list.find('state')
+        if state is not None:
+            self.state = state.text
+        else:
+            self.state = ''
+        self.task_states = Counter()  # added during task processing
+
+
+class Task(object):
+    task_num_re = re.compile(r'(\d+)-(\d+):(\d+)')
+
+    @staticmethod
+    def get_total_tasks(task_string):
+        tasks = 0
+        task_set = task_string.split(',')
+        for t in task_set:
+            if '-' in t:  # task range
+                m = Task.task_num_re.match(t)
+                (start, stop, step) = m.groups()
+                tasks += (int(stop) - int(start)) // int(step) + 1
+            else:
+                tasks += 1
+        return tasks
+
+    def __init__(self, job_list, queue_name=_default_queue):
+        self.job_id = int(job_list.find('JB_job_number').text)
+        self.job_name = job_list.find('full_job_name').text
+        self.job_owner = job_list.find('JB_owner').text
+        self.priority = job_list.find('JAT_prio').text
+        self.state_text = job_list.get('state')
+        self.state_code = ''.join(sorted(job_list.find('state').text))
+        self.used_slots = int(job_list.find('slots').text)
+        tasks = job_list.find('tasks')
+        if tasks is not None:
+            self.total_tasks = Task.get_total_tasks(tasks.text)
+        else:
+            self.total_tasks = 1
+        self.total_slots = self.used_slots * self.total_tasks
+        self.hard_requests = [{t.get('name'): t.text} for t in job_list.findall('hard_request')]
+        self.queue_name = queue_name
+
+    @property
+    def state(self):
+        if any(f in 'ERST' for f in self.state_code):
+            return 'error'
+        elif any(f in 'rt' for f in self.state_code):
+            return 'running'
+        elif any(f in 'hsqw' for f in self.state_code):
+            return 'pending'
+        elif 'd' in self.state_code:
+            return 'deleted'
+
+
+class Queue(object):
+    def __init__(self):
+        self.queue_name = None
+        self.slots_total = 0
+        self.slots_used = 0
+        self.slots_reserved = 0
+        self.slots_disabled = 0
+        self.slots_error = 0
+        self.task_states = Counter()
+        self.load_avg = 0.0
+
+    @property
+    def slots_available(self):
+        return self.slots_total - self.slots_used - self.slots_reserved - self.slots_error
+
+    def add_host(self, host):
+        if not self.queue_name:
+            self.queue_name = host.queue_name
+            self.slots_total = host.slots_total
+            self.slots_used = host.slots_used
+            self.slots_reserved = host.slots_reserved
+            self.load_avg = host.load_avg
+            if host.state and host.state in 'aoACDcdsuE':
+                self.slots_disabled = host.slots_total
+            self.task_states = host.task_states
+        elif self.queue_name != host.queue_name:
+            raise ValueError('Cannot add host for different queue (host={},queue={})'.format(host.queue_name, self.queue_name))
+        else:
+            self.slots_total += host.slots_total
+            self.slots_used += host.slots_used
+            self.slots_reserved += host.slots_reserved
+            if host.state and host.state in 'aoACDcdsuE':
+                self.slots_disabled += host.slots_total
+            self.load_avg = ((self.load_avg * self.slots_total)+(host.load_avg*host.slots_total)
+                             )/(self.slots_total + host.slots_total)
+            self.task_states.update(host.task_states)
+
+
+class Job(object):
+
+    def __init__(self, task=None):
+        self.job_id = None
+        self.job_name = None
+        self.job_owner = None
+        self.queue_name = None
+        self.task_state_codes = Counter()
+        self.task_states = Counter()
+
+        if task:
+            self.add_task(task)
+
+    def add_task(self, task):
+        if not self.job_id:
+            self.job_id = task.job_id
+            self.job_name = task.job_name
+            self.job_owner = task.job_owner
+            self.queue_name = task.queue_name
+            self.priority = task.priority
+            self.task_state_codes[task.state_code] += task.total_slots
+            self.task_states[task.state] += task.total_slots
+        elif self.job_id != task.job_id:
+            raise ValueError('Cannot add task for a different job (job={},task = {})'.format(self.job_id, task.job_id))
+        elif self.job_name != task.job_name:
+            raise ValueError('Inconsistent job name (job={}, task = {})'.format(self.job_name, task.job_name))
+        elif self.job_owner != task.job_owner:
+            raise ValueError('Inconsistent job owner (job={}, task = {})'.format(self.job_owner, task.job_owner))
+        else:
+            self.task_state_codes[task.state_code] += task.total_slots
+            self.task_states[task.state] += task.total_slots
+
+
+class Qstat(object):
+    """Runs and parses qstat"""
+
+    def __init__(self, xml=None):
+        self.hosts = []
+        self.tasks = []
+        self.jobs_by_id = defaultdict(Job)
+        self.jobs_by_user = defaultdict(list)
+        self.queues = defaultdict(Queue)  # queues by queue name
+
+        self.parse_qstat(xml)
+
+    def parse_qstat(self, xml=None):
+
+        if not xml:
+            xml = BytesIO(self.run_qstat())
+
+        root = etree.parse(xml)
+
+        # get nodes and running jobs
+        for q in root.findall('queue_info/Queue-List'):
+            host = Host(q)
+            self.hosts.append(host)
+            for job_list in q.findall('job_list'):
+                task = Task(job_list, queue_name=host.queue_name)
+                self.tasks.append(task)
+                host.task_states[task.state] += task.total_slots
+                self.jobs_by_id[task.job_id].add_task(task)
+            self.queues[host.queue_name].add_host(host)
+        # get queued tasks
+        for t in root.findall('job_info/job_list'):
+            task = Task(t)
+            self.tasks.append(Task)
+            for req in task.hard_requests:
+                queue_name = '{}.q'.format(list(req.keys())[0])
+                if queue_name in self.queues:  # N.B. JCVI-specific, but helpful
+                    task.queue_name = queue_name
+                    break
+            self.queues[task.queue_name].task_states[task.state] += task.total_slots
+            self.jobs_by_id[task.job_id].add_task(task)
+
+        for j in self.jobs_by_id.values():
+            self.jobs_by_user[j.job_owner].append(j)
+
+    @staticmethod
+    def run_qstat():
+
+        # -f gives results per server, -g t splits out parallel slots, -g d splits out array tasks -r gives more detailed job stats
+        cmd = 'qstat -xml -f -r -u *'.split()
+        log.debug('running {}'.format(' '.join(cmd)))
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        xml = process.communicate()[0]
+        if process.returncode:
+            raise OSError('Error running qstat. {}'.format(process.returncode))
+
+        return xml
+
+
+class App(object):
+    """
+        Main script wrapper: handles argument parsing and file opening
+    """
+
+    def __init__(self):
+        argv = sys.argv
+        # parse arguments
+        self.exe_name = argv[0]
+        self.options = None
+        self.parse_options(argv[1:])
+
+        # set up the logger
+        log.level = logging.WARNING
+        if self.options.verbose:
+            log.level = logging.DEBUG
+
+        log.debug('{0} {1}'.format(self.exe_name, ' '.join(argv[1:])))
+
+    def parse_options(self, args):
+        p = argparse.ArgumentParser(description='SGE qstat wrapper for additional information')
+        p.add_argument('-v', '--verbose', default=False, action='store_true', help='Verbose logging')
+        p.add_argument('--test_xml', help='read from XML file instead of running qstat (for testing)')
+        func = p.add_subparsers(title='Report Types', dest='report_type', description='For additional help, run qstatus <type> -h')
+        func.add_parser('queues', help='Show status by queue')
+        users = func.add_parser('users', help='Show user summary')
+        users.add_argument('-q', '--queues', action='append', help='Show specific queues, comma delimited')
+        jobs = func.add_parser('jobs', help='Show status by user/job (default option)')
+        jobview_limits = jobs.add_mutually_exclusive_group()
+        jobview_limits.add_argument('-a', '--all', action='store_true', help='Show all users (Default is show only yourself)')
+        jobview_limits.add_argument('-u', '--users', action='append', help='Show specific users, comma delimited')
+        jobs.add_argument('job_ids', metavar='job-ids', nargs='*', help='Show specific job IDs or names')
+        jobs.add_argument('-q', '--queues', action='append', help='Show specific queues, comma delimited')
+        self.options = p.parse_args(args)
+
+    def main(self):
+
+        if self.options.test_xml:
+            qstat = Qstat(open(self.options.test_xml, 'r'))
+        else:
+            qstat = Qstat()
+        if self.options.report_type == 'queues':
+            self.print_queue_summary(qstat)
+        elif self.options.report_type == 'users':
+            if self.options.queues:
+                queues = tuple(itertools.chain.from_iterable(q.split(',') for q in self.options.queues))
+            else:
+                queues = None
+            self.print_user_summary(qstat, queues)
+        else:
+            if self.options.queues:
+                queues = tuple(itertools.chain.from_iterable(q.split(',') for q in self.options.queues))
+            else:
+                queues = None
+
+            if self.options.users:
+                users = tuple(itertools.chain.from_iterable(u.split(',') for u in self.options.users))
+                log.debug('filtering by users {}'.format(', '.join(self.options.users)))
+            elif self.options.all:
+                users = None
+                log.debug('showing all users')
+            else:
+                users = (getpass.getuser(),)
+                log.debug('filtering by current user')
+
+            self.print_job_summary(qstat, users, self.options.job_ids, queues)
+
+    @staticmethod
+    def print_queue_summary(qstat):
+
+        template = '{:<20} {:>4} {:>5} {:>9} {:>8} {:>7} {:>5} {:>6}'
+        columns = 'Queue Load Total Available Disabled Running Error Queued'.split()
+        print(template.format(*columns))
+        for q_name in sorted(qstat.queues):
+            queue = qstat.queues[q_name]
+            load = '{:0.2f}'.format(queue.load_avg)
+            total = queue.slots_total
+            available = queue.slots_available
+            disabled = queue.slots_disabled
+            tasks_running = queue.task_states['running']
+            tasks_error = queue.task_states['error']
+            tasks_queued = queue.task_states['pending']
+            print(template.format(q_name, load, total, available, disabled, tasks_running, tasks_error, tasks_queued))
+
+    @staticmethod
+    def print_user_summary(qstat, queues=None):
+        columns = 'User Queue Running Pending Error'.split()
+        template = '{:<10} {:<15} {:>7} {:>7} {:>5}'
+        print(template.format(*columns))
+        for user in sorted(qstat.jobs_by_user):
+            queue_states = defaultdict(lambda: defaultdict(int))
+            for job in qstat.jobs_by_user[user]:
+                if queues and job.queue_name not in queues:
+                    continue
+                for st in job.task_states:
+                    queue_states[job.queue_name][st] += job.task_states[st]
+            for queue in sorted(queue_states.keys()):
+                print(template.format(user, queue, queue_states[queue]['running'], queue_states[queue]['pending'],
+                                      queue_states[queue]['error']))
+
+    @staticmethod
+    def print_job_summary(qstat, users=None, jobs=None, queues=None):
+        used_job_ids = []
+        used_statuses = set()
+        for job_id in sorted(qstat.jobs_by_id):
+            job = qstat.jobs_by_id[job_id]
+            ignore = False
+            if jobs and job.job_id not in jobs and job.job_name not in jobs:
+                ignore = True
+            elif users and job.job_owner not in users:
+                ignore = True
+            elif queues and job.queue_name not in queues:
+                ignore = True
+            if not ignore:
+                used_job_ids.append(job_id)
+                used_statuses.update(job.task_state_codes.keys())
+        statuses = sorted(used_statuses)
+        columns = 'Job-ID Priority Owner Queue'.split() + statuses + ['Job-Name', ]
+        template = '{:<8} {:<8} {:<10} {:<15} ' + ' '.join(('{:>4}',)*len(statuses)) + ' {:<20}'
+        print(template.format(*columns))
+        for job in (j for j in qstat.jobs_by_id.values() if j.job_id in used_job_ids):
+            values = ([job.job_id, job.priority, job.job_owner, job.queue_name] +
+                      [job.task_state_codes[i] for i in statuses] +
+                      [job.job_name, ]
+                      )
+            print(template.format(*values))
+
+
+# -----------------------------------------
+if __name__ == '__main__':
+    App().main()

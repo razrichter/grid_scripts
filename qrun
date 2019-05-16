@@ -1,0 +1,471 @@
+#!/usr/local/bin/perl
+use strict;
+use warnings;
+use Carp;
+
+umask 0000;
+
+package _Help;
+use Pod::Usage;
+
+=head1 SUMMARY
+
+rungrid -P <project> -c <command>  (-b <batch_size> | -j <number_of_jobs> ) [-o '<other_options>'] <parameter_file>
+
+=cut
+
+=head1 SYNOPSIS
+
+ls seqs/*.faa | rungrid -P 0390 -b 100 -c 'blastall -d NIAA -i {1} -e 1e-10'
+    blasts all the sequences in the seqs/ directory in batches of 100
+
+rungrid -P 0390 -j 100 -c 'blastall -d {1} -i {2}' db_and_file
+    starts 100 grid jobs to blast arbitrary databases and sequences specificed in a tab-delimited file of "db	seq_file" lines
+
+=cut
+
+=head1 OPTIONS
+
+  -P : project (required)
+  -c : the command template (required) -- remember to quote it
+  -b : batch size (number of rows of parameter_file) to run per grid noded
+  -j : number of jobs (defaults to 100, and cannot be used with -b)
+  -m : max number of jobs to run concurrently (defaults to 100)
+  -e : email address to send notifications to
+  -o : options to pass directly to qsub -- remember to quote it
+  -s : separate stdout and stderr
+  -N : job name (defaults to command name)
+  -w : wait for job to complete
+  -n : only display commands that would be run, instead of running them
+  <parameter_file> : a tab-delimited file(s) of parameters to fill into the command template. Use - for STDIN. If no files are specified, defaults to STDIN.
+
+Use the form {<column_number>} in the command to determine the replacement text. Columns in the parameter file start with 1.
+
+=cut
+
+=head2 Command Template Parameters
+
+    {1}, {2}, ... : Numeric parameters correspond to columns in the input file
+
+=cut
+
+=head1 EXAMPLES
+
+1. echo >>_options
+   Alex	sheep	great
+   Dan	cows	yummy
+   Bill	cockroaches	gross
+   _options | rungrid -P 1010 -c 'echo "{1} says {2} are {3}'
+
+-  will start 3 grid jobs, with the output:
+   Alex says sheep are great
+   Dan says cows are yummy
+   Bill says cockroaches are gross
+
+2. ls /my/fasta |rungrid -P 0380 -b 50 -c 'blast -p tblastx -d nr -i /my/fasta/{1} -o /my/output/{1}.blastout'
+
+-  runs blast (in batches of 50) on all the files in /my/fasta, and save the output in /my/output with the same name as the input
+
+If the inputs are already in a file, then just add the file name as the last parameter to the script.
+
+=cut
+
+
+package _Submission;
+use Getopt::Long qw/:config no_ignore_case/;
+use File::Temp qw/tempdir/;
+use File::Spec::Functions qw/rel2abs splitpath/;
+
+my $DEFAULT_NUM_JOBS = 100;
+my $DEFAULT_TMP_DIR = '/usr/local/scratch/MISC/qrun';
+my $TEMPDIR_TEMPLATE = 'tempdir.XXXXXXXX';
+my $DEFAULT_INPUT_FILENAME = 'all.parameters';
+my $SPLIT_FILE_PREFIX = 'split.';
+
+sub new {
+    my $class = shift;
+    local @ARGV = @_;
+    my ($project_id, $batch_size, $num_jobs, $max_concurrent, $cmd, $email, $separate_out_err, 
+        $job_name, $qsub_options, $dry_run, $verbose, $tmp_dir, $local);
+    my $res = GetOptions(
+        'help|h|?'  => sub {_Help::pod2usage(0)},
+        'man'       => sub {_Help::pod2usage(-exitval=>0, -verbose=>2)},
+        'project_id|P=s' => \$project_id,
+        'batch_size|b=i' => \$batch_size,
+        'num_jobs|j=i'    => \$num_jobs,
+        'max_concurrent|m=i' => \$max_concurrent,
+        'command|c=s'     => \$cmd,
+        'email|e=s'     => \$email,
+        'separate|s'    => \$separate_out_err,
+        'job_name|N=s'  => \$job_name,
+        'options|o=s'   => \$qsub_options,
+        'tmp_dir|t=s'   => \$tmp_dir,
+        'dry_run|n'     => \$dry_run,
+        'local'         => \$local,
+        'verbose|v'     => \$verbose,
+    );
+    _Help::pod2usage(-exitval=>2, -message => $res) if not $res;
+    my @inputs = @ARGV;
+    @inputs = '-' if ( not @inputs); # set STDIN if no specified input
+    if (! $cmd) {
+        _Help::pod2usage(-exitval=>1, -message=>'Must specify command (-c)');
+    }
+
+    if (! $project_id) {
+        _Help::pod2usage(-exitval=>1, -message=>'Must specify project id (-P)');
+    }
+    if ($batch_size and $num_jobs) {
+        _Help::pod2usage(-exitval=>1, -message=>'Must specify only one of batch_size (-b) and num_jobs (-j)');
+    }
+    elsif ( ! $batch_size and ! $num_jobs ) {
+        $num_jobs = $DEFAULT_NUM_JOBS;
+    }
+
+    if ($dry_run) {
+        $verbose = 1;
+    }
+
+    if ($tmp_dir) {
+        if (! is_on_nfs_filesystem($tmp_dir)) {
+            _Help::pod2usage(-exitval=>1, -message=>'Temp dir (-t) must be shared');
+        }
+    }
+    else {
+        $tmp_dir = $DEFAULT_TMP_DIR;
+    }
+
+    my $self = bless({
+        project_id => $project_id,
+        batch_size => $batch_size,
+        num_jobs => $num_jobs,
+        command => $cmd,
+        max_concurrent => $max_concurrent,
+        email => $email,
+        separate => $separate_out_err,
+        job_name => $job_name,
+        qsub_options => $qsub_options,
+        dry_run => $dry_run,
+        verbose => $verbose,
+        local => $local,
+        tmp_dir => $tmp_dir,
+        input_files => \@inputs,
+    }, $class);
+}
+
+sub setup {
+    my $self = shift;
+    my $no_batch = 0;
+    my $input_file = $self->{input_file};
+    if ( $self->{command} =~ /\{\d+\}/) {
+        if ( ! -d $self->{tmp_dir}) {
+            mkdir( $self->{tmp_dir}, 0777 ) or die "Can't create temporary directory root".$self->{tmp_dir}.". $!\n";
+        }
+        my $tempdir = tempdir($TEMPDIR_TEMPLATE, DIR => $self->{tmp_dir});
+        chmod 0777,$tempdir;
+        if ( ! -d $tempdir) {
+            die "Can't create temporary working directory $tempdir. $!\n";
+        }
+        $self->{working_dir} = $tempdir;
+        if (@{$self->{input_files}} == 1 and $self->{input_files}[0] ne '-') {
+            $input_file = $self->{input_files}->[0];
+            if (! is_on_nfs_filesystem($input_file)) {
+                my $out_file = "$tempdir/$DEFAULT_INPUT_FILENAME";
+                open my $out, '>', $out_file or die "Can't open $out_file.$!\n";
+                open my $in, '<', $input_file or die "Can't open $input_file. $!\n";
+                print $out $_ while (<$in>);
+                close $out or die "Error closing $out_file. $!\n";
+                $input_file = $out_file;
+            }
+        }
+        else {
+            @ARGV = @{$self->{input_files}};
+            my $out_file = "$tempdir/$DEFAULT_INPUT_FILENAME";
+            open my $out, '>', $out_file or die "Can't open $out_file. $!\n";
+            while (<>) {
+                print $out $_;
+            }
+            close $out or die "Error closing $out_file. $!\n";
+            $input_file = $out_file;
+        }
+        $self->{input_file} = $input_file;
+    }
+    else {
+        warn "Command does not use parameters. Submitting as a single job\n";
+        $self->{num_jobs} = 1;
+        $self->{batch_size} = 0;
+        $self->{no_batch} = 1;
+    }
+    my ($num_rows) = split /\s/, `wc -l $input_file`;
+    chomp $num_rows;
+
+    # calculate batch size/number of jobs
+    my $rows_to_do;
+    if (0 == $num_rows) {
+        $self->{num_jobs} = 1;
+        $self->{batch_size} = 0;
+        $self->{no_batch} = 1;
+    }
+    elsif ( $self->{batch_size} ) {
+        $self->{num_jobs} = find_min_coverage($num_rows, $self->{batch_size});
+        $rows_to_do = $self->{num_jobs} * $self->{batch_size};
+    }
+    else { # given number of jobs
+        if ($self->{num_jobs} >= $num_rows) {
+            $self->{batch_size} = 1;
+            $self->{num_jobs} = $num_rows;
+        }
+        else {
+            $self->{batch_size} = find_min_coverage($num_rows, $self->{num_jobs});
+            $rows_to_do = $self->{num_jobs} * $self->{batch_size};
+            if ($num_rows < $rows_to_do) {
+                $self->{num_jobs} = find_min_coverage($num_rows, $self->{batch_size});
+                $rows_to_do = $self->{num_jobs} * $self->{batch_size};
+            }
+            elsif ($num_rows > $rows_to_do) {
+                die "Math went wrong calculating number of jobs/batchsize\nBatch_size: ".$self->{batch_size}.". Job Count: ".$self->{num_rows}.". File rows: $num_rows. Rows to do: $rows_to_do\n";
+            }
+        }
+    }
+    $self->{max_concurrent} = 100 if (! $self->{max_concurrent});
+    if ($self->{max_concurrent} > $self->{num_jobs}) {
+        $self->{max_concurrent} = $self->{num_jobs};
+    }
+    $self->split_file();
+}
+
+sub run {
+    my $self = shift;
+    @ENV{qw/
+        RUNGRID_COMMAND
+        RUNGRID_BATCH_SIZE
+        RUNGRID_DRY_RUN
+        RUNGRID_VERBOSE
+    /} = @$self{qw/
+        command
+        batch_size
+        dry_run
+        verbose
+    /};
+    if (! $self->{no_batch}) {
+        if ($self->{num_jobs} == 1) {
+            $ENV{RUNGRID_INPUT_FILE} = $self->{input_file};
+        }
+        else {
+            @ENV{qw/
+                RUNGRID_INPUT_DIR
+                RUNGRID_INPUT_EXT_DIGITS
+            /} =
+            @$self{qw/
+                split_dir
+                num_digits
+            /};
+            $ENV{RUNGRID_INPUT_FILE_PREFIX}=$SPLIT_FILE_PREFIX;
+        }
+    }
+    if ($self->{local} or not $ENV{SGE_ROOT}) {
+        $self->run_local();
+    }
+    else {
+        $self->run_on_grid();
+    }
+}
+
+sub run_on_grid {
+    my $self = shift;
+    (undef, undef, my $prog_name) = splitpath($0);
+    if ($self->{command} !~ /^[{\s]/) {
+        my ($prog) = $self->{command} =~ /^([^\s{}&;()'"]+)/;
+        (undef, undef, $prog_name) = splitpath($prog);
+    }
+    my @qsub_options = (
+        '-P' => $self->{project_id},
+        '-cwd', '-V', '-r', 'no', 
+    );
+
+    if ( $self->{job_name} ) {
+        push @qsub_options, ('-N', "'".$self->{job_name}."'");
+    }
+    else {
+        push @qsub_options, ('-N', "'$prog_name'");
+    }
+    
+    if (! $self->{separate}) {
+        push @qsub_options, qw/-j y/;
+    }
+    if ($self->{email}) {
+        push @qsub_options, ( '-M', $self->{email} );
+    }
+
+    if (! $self->{no_batch} and $self->{num_jobs} > 1) {
+        push @qsub_options, (
+            '-t', '1-'.$self->{num_jobs},
+            '-tc', $self->{max_concurrent},
+        );
+    }
+
+    push @qsub_options, $self->{qsub_options} if $self->{qsub_options};
+    my $self_cmd = rel2abs($0);
+    my $cmd = "qsub @qsub_options $self_cmd";
+    if ($self->{verbose} ) {
+        warn "Environment:\n";
+        foreach ( sort grep {/^RUNGRID/} keys %ENV) {
+            if ($ENV{$_}) {
+                warn "  $_ = $ENV{$_}\n";
+            }
+        }
+        warn "Running command: $cmd\n";
+    }
+    if ($self->{dry_run} ) {
+        $self->run_local();
+    }
+    else {
+        exec ($cmd);
+    }
+}
+
+sub run_local {
+    my $self = shift;
+    $ENV{JOB_ID} = -1;
+    if ($self->{no_batch}) {
+        exec $0;
+    }
+    for (my $n = 1; $n <= $self->{num_jobs}; $n++) {
+        $ENV{SGE_TASK_ID} = $n;
+        # system("perl -d $0");
+        system($0);
+    }
+}
+
+sub split_file {
+    my $self = shift;
+
+    # split files
+    $self->{num_digits} = int(log($self->{num_jobs})/log(10)) + 1;
+    if (! $self->{no_batch} ) {
+        my $split_dir = $self->{split_dir} = $self->{working_dir}.'/split';
+        if ( ! -d $split_dir) {
+            mkdir $split_dir or die "Can't create split dir ($split_dir). $!\n";
+        }
+        my @cmd = (qw{/usr/bin/split -d -a },$self->{num_digits},'-l',$self->{batch_size},$self->{input_file}, "$split_dir/$SPLIT_FILE_PREFIX");
+        system(@cmd) and die "Can't split input. $!\n";
+    }
+}
+
+sub is_on_nfs_filesystem {
+    my $path = shift;
+    my $fs_type =  `stat -f -c'%T' $path`;
+    return ('nfs' eq $fs_type);
+}
+
+sub find_min_coverage {
+    my $total_num = shift;
+    my $block_size = shift;
+    use integer;
+    my $blocks = $total_num/$block_size; # using integer math
+    if ($total_num % $block_size) {
+        $blocks +=1;
+    }
+    return $blocks;
+}
+
+#--------------------------------------------------------------
+package _RunJob;
+
+sub new {
+    my $class = shift;
+    my $self = bless({}, $class);
+    @$self{qw/
+        command
+        batch_size
+        input_file
+        dry_run
+        verbose
+        input_dir
+        input_file_prefix
+        input_ext_digits
+        batch_num
+    /} = @ENV{qw/
+        RUNGRID_COMMAND
+        RUNGRID_BATCH_SIZE
+        RUNGRID_INPUT_FILE
+        RUNGRID_DRY_RUN
+        RUNGRID_VERBOSE
+        RUNGRID_INPUT_DIR
+        RUNGRID_INPUT_FILE_PREFIX
+        RUNGRID_INPUT_EXT_DIGITS
+        SGE_TASK_ID
+    /};
+    if ($self->{input_dir} ) {
+        my $input_dir = $self->{input_dir};
+        my $input_file_prefix = $self->{input_file_prefix};
+        my $input_ext_digits = $self->{input_ext_digits};
+        my $input_file = "$input_dir/$input_file_prefix".sprintf("%0${input_ext_digits}d",$self->{batch_num} -1 );
+        $self->{input_file} = $input_file;
+        if (! -f $input_file) {
+            die "Can't find input file $input_file\n";
+        }
+    }
+    return $self;
+}
+
+sub run {
+    my $self = shift;
+    my $input_file = $self->{input_file};
+    if ($self->{verbose}) {
+        warn "In batch ",$self->{batch_num},"\n";
+    }
+    if (! $input_file) {
+        # run command directly
+        $self->run_command_line([]);
+    }
+    else {
+        open my $in, '<', $input_file or die "Can't open input file $input_file. $!\n";
+        while (my $line = <$in>) {
+            chomp $line;
+            my @fields = split("\t", $line);
+            $self->run_command_line(\@fields);
+        }
+    }
+}
+
+sub run_command_line {
+    my $self = shift;
+    my $fields = shift;
+    my $command = $self->parse_command_line($fields);
+    if ($self->{verbose}) {
+        warn "Running $command\n";
+    }
+    if (! $self->{dry_run}) {
+        system($command);
+    }
+}
+
+sub parse_command_line {
+    my $self = shift;
+    my $fields = shift;
+    my $cmd = $self->{command};
+    $cmd =~ s/\{(\d+)\}/defined($fields->[$1 -1])?$fields->[$1 -1]:"{$1}"/ge;
+    return $cmd;
+}
+
+#--------------------------------------------------------------
+package main;
+
+sub main {
+    if ( $ENV{RUNGRID_COMMAND} ) {
+        my $job = _RunJob->new();
+        $job->run;
+    }
+    else {
+        my $submission = _Submission->new(@ARGV);
+        $submission->setup();
+        $submission->run();
+    }
+}
+
+
+if (! caller() ) {
+    main();
+}
+
+1;
